@@ -1,9 +1,11 @@
 import os
 import json
 import logging
+import time
 import cloudinary
 import cloudinary.uploader
 from google import genai
+from google.genai import errors as genai_errors
 import base64
 
 from config import (
@@ -22,6 +24,10 @@ cloudinary.config(
 )
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+GEMINI_MODEL = "gemini-3.6-flash"
+_MAX_RETRIES = 2
+_RETRY_DELAY_SECONDS = 2
 
 
 def upload_image_to_cloudinary(file_bytes: bytes, filename: str) -> str:
@@ -61,42 +67,65 @@ def analyze_complaint_with_ai(description: str, image_bytes: bytes, mime_type: s
     Citizen's description: {description}
     """.format(description=description)
 
-    try:
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        
-        response = gemini_client.models.generate_content(
-            model="gemini-3.5-flash",
-            contents=[
-                {"text": prompt},
-                {
-    "inline_data": {
-        "mime_type": mime_type,
-        "data": image_b64
-    }
-}
-            ],
-        )
-        result = json.loads(response.text)
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
-        return {
-            "is_valid": result.get("is_valid", True),
-            "rejection_reason": result.get("rejection_reason"),
-            "ai_category": result.get("category"),
-            "ai_urgency": result.get("urgency"),
-            "ai_department": result.get("department"),
-        }
-    except Exception:
-        # Fail closed: if AI verification couldn't run (bad key, rate limit,
-        # network issue, malformed response), don't silently treat the
-        # complaint as verified. Flag it for manual admin review instead.
-        logger.exception("Gemini analysis failed, flagging complaint for manual review")
-        return {
-            "is_valid": False,
-            "rejection_reason": "AI verification unavailable — flagged for manual review",
-            "ai_category": None,
-            "ai_urgency": None,
-            "ai_department": None,
-        }
+    last_error = None
+    for attempt in range(1, _MAX_RETRIES + 2):  # e.g. 3 total attempts
+        try:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": image_b64,
+                        }
+                    },
+                ],
+            )
+            result = json.loads(response.text)
+
+            return {
+                "is_valid": result.get("is_valid", True),
+                "rejection_reason": result.get("rejection_reason"),
+                "ai_category": result.get("category"),
+                "ai_urgency": result.get("urgency"),
+                "ai_department": result.get("department"),
+            }
+        except genai_errors.ServerError as e:
+            # Transient overload (503) or similar server-side issue.
+            # Worth a short retry before giving up.
+            last_error = e
+            logger.warning(
+                "Gemini server error on attempt %s/%s: %s",
+                attempt,
+                _MAX_RETRIES + 1,
+                e,
+            )
+            if attempt <= _MAX_RETRIES:
+                time.sleep(_RETRY_DELAY_SECONDS)
+                continue
+        except Exception as e:
+            # Non-retryable error (bad request, auth issue, malformed
+            # response, etc). Don't waste time retrying these.
+            last_error = e
+            break
+
+    # Fail closed: if AI verification couldn't run after retries (bad key,
+    # persistent overload, network issue, malformed response), don't
+    # silently treat the complaint as verified. Flag it for manual review.
+    logger.exception(
+        "Gemini analysis failed after retries, flagging complaint for manual review: %s",
+        last_error,
+    )
+    return {
+        "is_valid": False,
+        "rejection_reason": "AI verification unavailable — flagged for manual review",
+        "ai_category": None,
+        "ai_urgency": None,
+        "ai_department": None,
+    }
 
 
 def serialize_complaint(complaint, upvote_count: int = 0, user_has_upvoted: bool = False) -> dict:
