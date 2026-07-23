@@ -52,8 +52,7 @@ async def create_complaint(
         description=description,
         latitude=latitude,
         longitude=longitude,
-        issue_type=ai_result["ai_category"] or "Unclassified",
-        ai_category=ai_result["ai_category"],
+        issue_type=ai_result["ai_department"] or "Unclassified",
         ai_urgency=ai_result["ai_urgency"],
         ai_department=ai_result["ai_department"],
         image_url=image_url,
@@ -65,6 +64,12 @@ async def create_complaint(
         db.add(complaint)
         db.commit()
         db.refresh(complaint)
+
+        # The reporter automatically upvotes their own complaint — they
+        # clearly care about the issue they just reported. This upvote
+        # cannot later be removed by them (enforced in toggle_upvote below).
+        db.add(Upvote(complaint_id=complaint.id, user_id=current_user.id))
+        db.commit()
     except SQLAlchemyError:
         db.rollback()
         logger.exception("Failed to save complaint user_id=%s", current_user.id)
@@ -80,6 +85,8 @@ async def create_complaint(
         ai_result["is_valid"],
     )
 
+    upvote_count = db.query(Upvote).filter(Upvote.complaint_id == complaint.id).count()
+
     return success_response(
         data={
             "message": (
@@ -88,7 +95,7 @@ async def create_complaint(
                 else f"Complaint flagged for manual review: {ai_result['rejection_reason']}"
             ),
             "is_valid": ai_result["is_valid"],
-            "complaint": serialize_complaint(complaint),
+            "complaint": serialize_complaint(complaint, upvote_count, user_has_upvoted=True),
         }
     )
 
@@ -133,7 +140,6 @@ def get_my_complaints(
     total = query.count()
     complaints = query.offset(offset).limit(limit).all()
 
-    # Get upvote counts and user upvote status for each complaint
     result = []
     for complaint in complaints:
         upvote_count = db.query(Upvote).filter(
@@ -191,10 +197,21 @@ def toggle_upvote(
     if not complaint:
         error_response("Complaint not found", status_code=status.HTTP_404_NOT_FOUND)
 
+    is_owner = complaint.user_id == current_user.id
+
     existing_upvote = db.query(Upvote).filter(
         Upvote.complaint_id == complaint_id,
         Upvote.user_id == current_user.id,
     ).first()
+
+    if existing_upvote and is_owner:
+        # Reporters automatically upvote their own complaint on creation —
+        # that upvote can't be removed. It's their own reported issue; it
+        # doesn't make sense for them to "un-support" it.
+        error_response(
+            "You can't remove the upvote on your own complaint",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
 
     try:
         if existing_upvote:
