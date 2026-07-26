@@ -62,14 +62,16 @@ async def create_complaint(
 
     try:
         db.add(complaint)
-        db.commit()
-        db.refresh(complaint)
+        db.flush()  # assigns complaint.id without committing yet
 
         # The reporter automatically upvotes their own complaint — they
         # clearly care about the issue they just reported. This upvote
         # cannot later be removed by them (enforced in toggle_upvote below).
+        # Both inserts commit together atomically: if either fails, neither
+        # is saved — avoids a complaint existing without its auto-upvote.
         db.add(Upvote(complaint_id=complaint.id, user_id=current_user.id))
         db.commit()
+        db.refresh(complaint)
     except SQLAlchemyError:
         db.rollback()
         logger.exception("Failed to save complaint user_id=%s", current_user.id)

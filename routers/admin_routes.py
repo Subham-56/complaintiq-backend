@@ -1,5 +1,6 @@
 import logging
 from fastapi import APIRouter, Depends, Query, status
+from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -179,24 +180,41 @@ def get_analytics(
     resolved = status_counts.get("Resolved", 0)
     resolution_rate = round((resolved / total_complaints * 100), 1) if total_complaints > 0 else 0
 
-    top_upvoted = db.query(Complaint, User).join(
-        User, Complaint.user_id == User.id
-    ).order_by(Complaint.id.desc()).limit(5).all()
+    # Real "most upvoted" query: count upvotes per complaint via a subquery,
+    # exclude already-Resolved complaints (nothing actionable left there),
+    # and order by actual upvote count — not by complaint recency, which is
+    # what the old version of this query accidentally did.
+    upvote_counts_subq = (
+        db.query(
+            Upvote.complaint_id,
+            func.count(Upvote.id).label("upvote_count"),
+        )
+        .group_by(Upvote.complaint_id)
+        .subquery()
+    )
 
-    top_upvoted_list = []
-    for complaint, user in top_upvoted:
-        upvote_count = db.query(Upvote).filter(
-            Upvote.complaint_id == complaint.id
-        ).count()
-        top_upvoted_list.append({
+    top_upvoted_rows = (
+        db.query(
+            Complaint,
+            func.coalesce(upvote_counts_subq.c.upvote_count, 0).label("upvote_count"),
+        )
+        .outerjoin(upvote_counts_subq, Complaint.id == upvote_counts_subq.c.complaint_id)
+        .filter(Complaint.status != "Resolved")
+        .order_by(func.coalesce(upvote_counts_subq.c.upvote_count, 0).desc())
+        .limit(5)
+        .all()
+    )
+
+    top_upvoted_list = [
+        {
             "id": complaint.id,
             "description": complaint.description,
             "ai_department": complaint.ai_department,
             "status": complaint.status,
             "upvote_count": upvote_count,
-        })
-
-    top_upvoted_list.sort(key=lambda x: x["upvote_count"], reverse=True)
+        }
+        for complaint, upvote_count in top_upvoted_rows
+    ]
 
     total_users = db.query(User).filter(User.role == "user").count()
 
