@@ -108,7 +108,14 @@ def get_community_feed(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    query = db.query(Complaint).order_by(Complaint.created_at.desc())
+    # Public feed excludes complaints that aren't verified, legitimate
+    # issues yet (Under Review) or were dismissed (Rejected) — citizens
+    # shouldn't see unverified/dismissed reports in the community feed.
+    # Pending/In Progress/Resolved stay visible so people can see active
+    # issues and confirm ones that got fixed.
+    query = db.query(Complaint).filter(
+        Complaint.status.notin_(["Under Review", "Rejected"])
+    ).order_by(Complaint.created_at.desc())
     total = query.count()
     complaints = query.offset(offset).limit(limit).all()
 
@@ -198,6 +205,14 @@ def toggle_upvote(
     complaint = db.query(Complaint).filter(Complaint.id == complaint_id).first()
     if not complaint:
         error_response("Complaint not found", status_code=status.HTTP_404_NOT_FOUND)
+
+    if complaint.status in ("Resolved", "Rejected"):
+        # A closed complaint doesn't need more support gathered — it's
+        # either already handled or was dismissed as invalid.
+        error_response(
+            f"This complaint is already {complaint.status} and can no longer be upvoted.",
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
 
     is_owner = complaint.user_id == current_user.id
 
